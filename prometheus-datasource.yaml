@@ -1,0 +1,13 @@
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        url: http://prometheus-deployment-server.prometheus.svc.cluster.local
+        access: proxy
+        isDefault: true
+        editable: true
+        jsonData:
+          timeInterval: "30s"
+          httpMethod: POST
