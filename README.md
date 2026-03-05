@@ -28,4 +28,22 @@ kubectl apply -f hpa.yaml
 kubectl autoscale deployment hpa-deploy --cpu-percent=50 --min=1 --max=10
 
 ## Grafana Dashboard
-Import Dashboard ID: 7249
+
+Yeh saare dashboard IDs the jo humne try kiye:
+
+Dashboard 1 — 6417 (Original - Kubernetes Cluster Prometheus)
+ID-6417
+Dashboard 2 — 3119 (Kubernetes cluster monitoring)
+ID-3119
+Dashboard 3 — 13770 (Kubernetes all-in-one - Chinese)
+ID-13770
+Dashboard 4 — 15661 (EKS specific)
+ID-15661
+Dashboard 5 — 7249 (Kubernetes Cluster Summary ✅)
+ID-7249
+Dashboard 6 — 1860 (Node Exporter Full)
+ID-1860
+Dashboard 7 — 15757 (Kubernetes Cluster Monitoring)
+ID-15757
+Dashboard 8 — 3662 (Prometheus Stats)
+ID-3662
