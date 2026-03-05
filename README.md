@@ -1,1 +1,0 @@
-# prometheus-grafana-eks-monitoring
