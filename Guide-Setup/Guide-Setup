@@ -1,0 +1,340 @@
+
+Prometheus & Grafana
+Monitoring on EKS Cluster
+Step-by-Step Commands Guide  |  Parts 1 – 4
+
+
+PART 1 — EC2 Instance & Prerequisites Setup
+
+Step 1.1 – Launch EC2 Instance (AWS Console)
+
+#	Action	Command / Detail
+1	Open AWS Console	Go to EC2 → Click 'Launch Instance'
+2	Name the instance	Name: landing-transform  (your project name)
+3	Select OS	Choose Ubuntu (latest LTS)
+4	Instance type	t2.micro  (Free Tier eligible)
+5	Create Key Pair	Name: landing-transform-keypair → Click 'Create key pair'
+6	Network settings	Allow SSH (port 22) only — leave rest as default
+7	Storage	Leave default storage settings
+8	Launch	Click 'Launch Instance' → Wait for running state
+
+Step 1.2 – Connect & Install AWS CLI v2
+
+# Connect to EC2 via SSH
+ssh -i landing-transform-keypair.pem ubuntu@<EC2-PUBLIC-IP>
+
+# Download AWS CLI v2
+curl 'https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip' -o 'awscliv2.zip'
+
+# Install unzip
+sudo apt install unzip -y
+
+# Unzip the package
+unzip awscliv2.zip
+
+# Install AWS CLI
+sudo ./aws/install
+
+# Verify installation
+aws --version
+
+Step 1.3 – Configure AWS CLI
+
+aws configure
+# Enter when prompted:
+# AWS Access Key ID:     <your-access-key>
+# AWS Secret Access Key: <your-secret-key>
+# Default region name:   us-east-1
+# Default output format: json
+
+Step 1.4 – Install kubectl
+
+# Download kubectl
+curl -LO 'https://dl.k8s.io/release/$(curl -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl'
+
+# Make it executable
+chmod +x kubectl
+
+# Move to PATH
+sudo mv kubectl /usr/local/bin/
+
+# Verify
+kubectl version --client
+
+Step 1.5 – Install Helm
+
+# Download Helm install script
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# Verify
+helm version
+
+Step 1.6 – Install eksctl & Create EKS Cluster
+
+# Install eksctl
+curl --silent --location 'https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz' | tar xz -C /tmp
+sudo mv /tmp/eksctl /usr/local/bin
+
+# Create EKS Cluster
+eksctl create cluster \
+  --name landing-transform-my-eks-cluster \
+  --region us-east-1
+
+# Verify nodes are ready
+kubectl get nodes
+💡 Cluster creation takes 15–20 minutes. Wait until all nodes show STATUS = Ready.
+
+Step 1.7 – Deploy Prometheus via Helm
+
+# Create Prometheus namespace
+kubectl create namespace prometheus
+
+# Add Prometheus Helm repo
+helm repo add prometheus https://prometheus-community.github.io/helm-charts
+
+# List repos to verify
+helm repo ls
+
+# Update repos
+helm repo update
+
+# Deploy Prometheus
+helm install prometheus-deployment prometheus/prometheus \
+  --namespace prometheus \
+  --set alertmanager.persistentVolume.storageClass='openebs-hostpath' \
+  --set server.persistentVolume.storageClass='openebs-hostpath'
+
+# Verify Prometheus pods
+kubectl get pods -n prometheus
+
+# Get Prometheus service (copy the LoadBalancer URL)
+kubectl get svc -n prometheus
+💡 Access Prometheus in browser using the LoadBalancer external URL on port 80.
+
+ 
+PART 2 — Deploy Grafana & Import Dashboard
+
+Step 2.1 – Create Prometheus DataSource File
+
+Create the file prometheus-datasource.yaml before deploying Grafana:
+
+# Create the datasource YAML file
+vi prometheus-datasource.yaml
+
+# Paste the following content:
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    url: http://prometheus-deployment-server.prometheus.svc.cluster.local
+    access: proxy
+    isDefault: true
+
+Step 2.2 – Deploy Grafana via Helm
+
+# Create Grafana namespace
+kubectl create namespace grafana
+
+# Add Grafana Helm repo
+helm repo add grafana https://grafana.github.io/helm-charts
+
+# Update repos
+helm repo update
+
+# Deploy Grafana with all settings
+helm install grafana grafana/grafana \
+  --namespace grafana \
+  --set persistence.storageClassName='openebs-hostpath' \
+  --set persistence.enabled=true \
+  --set adminPassword='secret' \
+  --values prometheus-datasource.yaml \
+  --set service.type=LoadBalancer
+
+Step 2.3 – Verify Grafana Deployment
+
+# Check all Grafana pods/services
+kubectl get all -n grafana
+
+# Check Persistent Volume Claim
+kubectl get pvc -n grafana
+
+# Get Grafana admin password
+kubectl get secret --namespace grafana grafana \
+  -o jsonpath='{.data.admin-password}' | base64 --decode
+
+# Get Grafana LoadBalancer URL
+kubectl get svc -n grafana
+
+Step 2.4 – Access & Configure Grafana Dashboard
+
+#	Action	Command / Detail
+1	Open Browser	Go to: http://<GRAFANA-LOADBALANCER-URL>
+2	Login	Username: admin   |   Password: secret (or from Step 2.3)
+3	Go to Dashboards	Click Menu → Dashboards → New → Import
+4	Import Dashboard	Enter Dashboard ID: 6417  → Click 'Load'
+5	Select Datasource	Choose 'prometheus-default' from the dropdown
+6	Click Import	Dashboard is now live with cluster metrics
+
+💡 Dashboard 6417 (by secca1) shows: CPU utilization, Memory usage, Disk usage, Pod count, Node status, and Container running state.
+
+ 
+PART 3 — HPA (Horizontal Pod Autoscaler) & Load Testing
+
+Step 3.1 – Verify Metrics Server
+
+# Check metrics-server is running (required for HPA)
+kubectl get pods -n kube-system | grep metrics-server
+
+Step 3.2 – Create & Deploy the HPA Application
+
+Create hpa.yaml with a Deployment + LoadBalancer Service:
+
+# Create HPA manifest
+vi hpa.yaml
+
+# The file should contain:
+# - A Deployment named: hpa-deploy
+# - A Service of type: LoadBalancer
+
+# Apply the manifest
+kubectl apply -f hpa.yaml
+
+# Verify pod and deployment
+kubectl get pod,deploy,svc
+
+Step 3.3 – Create Horizontal Pod Autoscaler
+
+# Create HPA for the deployment
+kubectl autoscale deployment hpa-deploy \
+  --cpu-percent=50 \
+  --min=1 \
+  --max=10
+
+# Verify HPA is created
+kubectl get hpa
+
+# Watch HPA live (open Terminal 1)
+kubectl get hpa -w
+
+Step 3.4 – Generate Load (Open Terminal 2)
+
+# Run load generator in a new terminal
+kubectl run load-generator \
+  --image=busybox \
+  --restart=Never \
+  -- /bin/sh -c 'while true; do wget -q -O- http://<LOAD-BALANCER-URL>; done'
+
+# Watch pods scale up in Terminal 1
+kubectl get pods -w
+
+# Check CPU utilization goes above 50% threshold
+kubectl get hpa -w
+💡 CPU utilization will jump (e.g. 0% → 179% → 250%). HPA will automatically scale from 1 pod up to 10 pods based on threshold.
+
+Step 3.5 – Observe in Grafana Dashboard
+
+#	Action	Command / Detail
+1	Open Grafana	Go to Dashboard 6417 in browser
+2	Refresh	Click refresh icon or set auto-refresh to 5 min
+3	Watch Pod Count	Cluster Pod Capacity graph shows pods increasing
+4	Watch CPU	CPU utilization graph spikes during load generation
+5	Delete HPA	kubectl delete hpa hpa-deploy   →   pods scale back down
+6	Re-observe	Dashboard shows pod count decreasing after HPA deleted
+
+Step 3.6 – Cleanup Load Test Resources
+
+# Delete the load generator pod
+kubectl delete pod load-generator
+
+# Delete HPA
+kubectl delete hpa hpa-deploy
+
+# (Optional) Delete HPA application
+kubectl delete -f hpa.yaml
+
+ 
+PART 4 — Cleanup (Uninstall Everything)
+
+💡 Always clean up in this order: Helm releases → PVCs → EKS Cluster → EC2 Instance
+
+Step 4.1 – Uninstall Prometheus
+
+# List Prometheus Helm release
+helm ls -n prometheus
+
+# Uninstall Prometheus
+helm uninstall prometheus-deployment -n prometheus
+
+# Verify nothing remains
+kubectl get all -n prometheus
+
+Step 4.2 – Uninstall Grafana
+
+# List Grafana Helm release
+helm ls -n grafana
+
+# Uninstall Grafana
+helm uninstall grafana -n grafana
+
+# Verify nothing remains
+kubectl get all -n grafana
+
+Step 4.3 – Delete Remaining Services & PVCs
+
+# Check all resources across all namespaces
+kubectl get all -A
+
+# Delete any leftover LoadBalancer services manually
+kubectl delete svc <service-name> -n grafana
+
+# Check PVCs
+kubectl get pvc -n prometheus
+kubectl get pvc -n grafana
+
+# Delete PVCs
+kubectl delete pvc <pvc-name> -n prometheus
+kubectl delete pvc <pvc-name> -n grafana
+
+# Verify all deleted
+kubectl get all -A
+
+Step 4.4 – Delete HPA Application (if not done in Part 3)
+
+# Delete HPA and deployment
+kubectl delete -f hpa.yaml
+
+# Verify default namespace is clean
+kubectl get all
+
+Step 4.5 – Delete EKS Cluster
+
+# Delete the EKS cluster
+eksctl delete cluster \
+  --name landing-transform-my-eks-cluster \
+  --region us-east-1
+
+# Verify deletion in AWS Console:
+# Go to → EKS → Elastic Kubernetes Service → US East 1
+# Status should change to: Deleting → then disappear
+
+Step 4.6 – Terminate EC2 Instance
+
+#	Action	Command / Detail
+1	Open AWS Console	Go to EC2 → Instances
+2	Select Instance	Select: landing-transform instance
+3	Terminate	Instance State → Terminate Instance → Confirm
+4	Delete Key Pair	Go to Key Pairs → Select landing-transform-keypair → Actions → Delete
+
+✅ Cleanup Complete — Summary
+
+Resource	Status
+Prometheus (Helm release)	✅ Deleted
+Grafana (Helm release)	✅ Deleted
+Persistent Volume Claims	✅ Deleted
+HPA + Application	✅ Deleted
+EKS Cluster	✅ Deleted
+EC2 Instance	✅ Deleted
+Key Pair	✅ Deleted
+
+
+
