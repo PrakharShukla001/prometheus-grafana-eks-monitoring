@@ -1,123 +1,116 @@
 #!/bin/bash
 
-# ============================================================
-# Prometheus & Grafana Monitoring Stack - AWS EKS Automation
-# ============================================================
+# ================================================================
+#   Prometheus & Grafana Monitoring on AWS EKS — Full Automation
+#   Production-grade Kubernetes monitoring stack via Helm
+# ================================================================
 
-set -e
+set -euo pipefail
 
-# ---------- Color Codes ----------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-# ---------- Config ----------
+# ──────────────────────────────────────────────
+#  CONFIG  (change these if needed)
+# ──────────────────────────────────────────────
 CLUSTER_NAME="landing-transform-my-eks-cluster"
 REGION="us-east-1"
-GRAFANA_ADMIN_PASSWORD="secret"
 STORAGE_CLASS="gp3"
+GRAFANA_PASSWORD="secret"
+HPA_CPU_PERCENT=50
+HPA_MIN=1
+HPA_MAX=10
 
-GRAFANA_DASHBOARDS=(
-  "6417:Kubernetes Cluster Prometheus"
-  "3119:Kubernetes Cluster Monitoring"
-  "13770:Kubernetes All-in-One"
-  "15661:EKS Specific"
-  "7249:Kubernetes Cluster Summary"
-  "1860:Node Exporter Full"
-  "15757:Kubernetes Cluster Monitoring v2"
-  "3662:Prometheus Stats"
+DASHBOARD_IDS=(6417 3119 13770 15661 7249 1860 15757 3662)
+declare -A DASHBOARD_NAMES=(
+  [6417]="Kubernetes Cluster Prometheus"
+  [3119]="Kubernetes Cluster Monitoring"
+  [13770]="Kubernetes All-in-One"
+  [15661]="EKS Specific"
+  [7249]="Kubernetes Cluster Summary ✅"
+  [1860]="Node Exporter Full"
+  [15757]="Kubernetes Cluster Monitoring v2"
+  [3662]="Prometheus Stats"
 )
 
-# ---------- Logging ----------
-log_info()    { echo -e "${BLUE}[INFO]${NC}  $1"; }
-log_success() { echo -e "${GREEN}[OK]${NC}    $1"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $1"; }
-log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
-log_section() { echo -e "\n${BOLD}${CYAN}========================================${NC}"; echo -e "${BOLD}${CYAN}  $1${NC}"; echo -e "${BOLD}${CYAN}========================================${NC}\n"; }
+# ──────────────────────────────────────────────
+#  COLORS & LOGGING
+# ──────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-# ---------- Prerequisite Check ----------
+info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
+ok()      { echo -e "${GREEN}[ OK ]${NC}  $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error()   { echo -e "${RED}[ERR ]${NC}  $*"; exit 1; }
+section() {
+  echo ""
+  echo -e "${BOLD}${CYAN}──────────────────────────────────────────────${NC}"
+  echo -e "${BOLD}${CYAN}  $*${NC}"
+  echo -e "${BOLD}${CYAN}──────────────────────────────────────────────${NC}"
+  echo ""
+}
+
+# ──────────────────────────────────────────────
+#  PREREQUISITES
+# ──────────────────────────────────────────────
 check_prerequisites() {
-  log_section "Checking Prerequisites"
-  local tools=("eksctl" "kubectl" "helm" "aws")
-  local missing=()
+  section "Prerequisites Check"
 
-  for tool in "${tools[@]}"; do
+  for tool in eksctl kubectl helm aws curl; do
     if command -v "$tool" &>/dev/null; then
-      log_success "$tool is installed"
+      ok "$tool found"
     else
-      log_error "$tool is NOT installed"
-      missing+=("$tool")
+      error "$tool is not installed. Please install it and retry."
     fi
   done
 
-  if [ ${#missing[@]} -ne 0 ]; then
-    log_error "Missing tools: ${missing[*]}. Please install them and re-run."
-    exit 1
-  fi
-
-  log_info "Checking AWS credentials..."
+  info "Verifying AWS credentials..."
   if aws sts get-caller-identity &>/dev/null; then
-    log_success "AWS credentials are valid"
+    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    ok "AWS credentials valid — Account: $ACCOUNT_ID"
   else
-    log_error "AWS credentials not configured. Run: aws configure"
-    exit 1
+    error "AWS credentials not configured. Run: aws configure"
   fi
 }
 
-# ---------- Step 1: Create EKS Cluster ----------
-create_eks_cluster() {
-  log_section "Step 1: Creating EKS Cluster"
+# ──────────────────────────────────────────────
+#  STEP 1 — Create EKS Cluster
+# ──────────────────────────────────────────────
+step1_create_eks_cluster() {
+  section "Step 1 — Create EKS Cluster"
 
   if eksctl get cluster --name "$CLUSTER_NAME" --region "$REGION" &>/dev/null; then
-    log_warn "Cluster '$CLUSTER_NAME' already exists. Skipping creation."
+    warn "Cluster '$CLUSTER_NAME' already exists. Skipping creation."
   else
-    log_info "Creating EKS cluster: $CLUSTER_NAME in $REGION ..."
+    info "Creating EKS cluster: $CLUSTER_NAME in $REGION ..."
     eksctl create cluster \
       --name "$CLUSTER_NAME" \
       --region "$REGION"
-    log_success "EKS cluster created successfully!"
+    ok "Cluster created!"
   fi
 
-  log_info "Updating kubeconfig..."
+  info "Updating kubeconfig..."
   aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION"
-  log_success "kubeconfig updated"
+  ok "kubeconfig updated"
 
-  log_info "Verifying cluster connectivity..."
+  info "Verifying nodes..."
   kubectl get nodes
 }
 
-# ---------- Step 2: Install EBS CSI Driver ----------
-install_ebs_csi_driver() {
-  log_section "Step 2: Installing EBS CSI Driver"
+# ──────────────────────────────────────────────
+#  STEP 2 — Install EBS CSI Driver
+# ──────────────────────────────────────────────
+step2_install_ebs_csi_driver() {
+  section "Step 2 — Install EBS CSI Driver (gp3 Storage)"
 
-  local cluster_oidc
-  cluster_oidc=$(aws eks describe-cluster \
-    --name "$CLUSTER_NAME" \
-    --region "$REGION" \
-    --query "cluster.identity.oidc.issuer" \
-    --output text)
-
-  log_info "OIDC Issuer: $cluster_oidc"
-
-  # Check if OIDC provider exists
-  if eksctl utils associate-iam-oidc-provider \
+  info "Associating OIDC provider..."
+  eksctl utils associate-iam-oidc-provider \
     --cluster "$CLUSTER_NAME" \
     --region "$REGION" \
-    --approve 2>/dev/null; then
-    log_success "OIDC provider associated"
-  else
-    log_warn "OIDC provider may already be associated. Continuing..."
-  fi
+    --approve && ok "OIDC provider associated" || warn "OIDC may already be associated. Continuing..."
 
-  # Create IAM service account for EBS CSI
   if kubectl get serviceaccount ebs-csi-controller-sa -n kube-system &>/dev/null; then
-    log_warn "EBS CSI service account already exists. Skipping."
+    warn "IAM service account already exists. Skipping."
   else
-    log_info "Creating IAM service account for EBS CSI Driver..."
+    info "Creating IAM service account for EBS CSI Driver..."
     eksctl create iamserviceaccount \
       --name ebs-csi-controller-sa \
       --namespace kube-system \
@@ -127,33 +120,28 @@ install_ebs_csi_driver() {
       --approve \
       --role-only \
       --role-name AmazonEKS_EBS_CSI_DriverRole
-    log_success "IAM service account created"
+    ok "IAM service account created"
   fi
 
-  # Add EBS CSI addon
   if aws eks describe-addon \
     --cluster-name "$CLUSTER_NAME" \
     --addon-name aws-ebs-csi-driver \
     --region "$REGION" &>/dev/null; then
-    log_warn "EBS CSI addon already installed. Skipping."
+    warn "EBS CSI addon already installed. Skipping."
   else
-    local account_id
-    account_id=$(aws sts get-caller-identity --query Account --output text)
-
-    log_info "Installing EBS CSI Driver addon..."
+    info "Installing EBS CSI Driver addon..."
     aws eks create-addon \
       --cluster-name "$CLUSTER_NAME" \
       --addon-name aws-ebs-csi-driver \
-      --service-account-role-arn "arn:aws:iam::${account_id}:role/AmazonEKS_EBS_CSI_DriverRole" \
+      --service-account-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/AmazonEKS_EBS_CSI_DriverRole" \
       --region "$REGION"
-    log_success "EBS CSI Driver addon installed"
+    ok "EBS CSI Driver addon installed"
   fi
 
-  # Verify gp3 StorageClass
-  if kubectl get storageclass gp3 &>/dev/null; then
-    log_success "gp3 StorageClass already exists"
+  if kubectl get storageclass "$STORAGE_CLASS" &>/dev/null; then
+    warn "StorageClass '$STORAGE_CLASS' already exists. Skipping."
   else
-    log_info "Creating gp3 StorageClass..."
+    info "Creating gp3 StorageClass..."
     kubectl apply -f - <<EOF
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -169,56 +157,54 @@ reclaimPolicy: Delete
 volumeBindingMode: WaitForFirstConsumer
 allowVolumeExpansion: true
 EOF
-    log_success "gp3 StorageClass created"
+    ok "gp3 StorageClass created"
   fi
 }
 
-# ---------- Step 3: Deploy Prometheus ----------
-deploy_prometheus() {
-  log_section "Step 3: Deploying Prometheus"
+# ──────────────────────────────────────────────
+#  STEP 3 — Deploy Prometheus
+# ──────────────────────────────────────────────
+step3_deploy_prometheus() {
+  section "Step 3 — Deploy Prometheus"
 
-  log_info "Adding Prometheus Helm repo..."
+  info "Adding Prometheus Helm repo..."
   helm repo add prometheus https://prometheus-community.github.io/helm-charts
   helm repo update
-  log_success "Helm repo added"
+  ok "Helm repo ready"
 
-  if kubectl get namespace prometheus &>/dev/null; then
-    log_warn "Namespace 'prometheus' already exists. Skipping creation."
-  else
-    kubectl create namespace prometheus
-    log_success "Namespace 'prometheus' created"
-  fi
+  kubectl get namespace prometheus &>/dev/null || kubectl create namespace prometheus && ok "Namespace 'prometheus' ready"
 
   if helm status prometheus-deployment -n prometheus &>/dev/null; then
-    log_warn "Prometheus already deployed. Skipping installation."
+    warn "Prometheus already deployed. Skipping."
   else
-    log_info "Installing Prometheus..."
+    info "Installing Prometheus..."
     helm install prometheus-deployment prometheus/prometheus \
       --namespace prometheus \
       --set alertmanager.persistentVolume.storageClass="$STORAGE_CLASS" \
       --set server.persistentVolume.storageClass="$STORAGE_CLASS"
-    log_success "Prometheus deployed!"
+    ok "Prometheus deployed!"
   fi
 
-  log_info "Waiting for Prometheus pods to be ready..."
+  info "Waiting for Prometheus pods..."
   kubectl wait --for=condition=ready pod \
     -l app.kubernetes.io/name=prometheus \
     -n prometheus \
-    --timeout=120s 2>/dev/null || log_warn "Timeout waiting for Prometheus pods. Check manually."
+    --timeout=120s 2>/dev/null || warn "Pods not ready yet — check manually with: kubectl get pods -n prometheus"
 
   kubectl get pods -n prometheus
 }
 
-# ---------- Step 4: Create Grafana Datasource Config ----------
-create_prometheus_datasource() {
-  log_section "Step 4: Creating Grafana Datasource Config"
+# ──────────────────────────────────────────────
+#  STEP 4 — Create Grafana Datasource Config
+# ──────────────────────────────────────────────
+step4_create_datasource_config() {
+  section "Step 4 — Create Grafana Datasource Config"
 
-  local prometheus_svc
-  prometheus_svc=$(kubectl get svc -n prometheus \
-    -l app.kubernetes.io/name=prometheus,app.kubernetes.io/component=server \
+  PROM_SVC=$(kubectl get svc -n prometheus \
+    -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/component=server" \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "prometheus-deployment-server")
 
-  log_info "Prometheus Service: $prometheus_svc"
+  info "Prometheus Service detected: $PROM_SVC"
 
   cat > /tmp/prometheus-datasource.yaml <<EOF
 datasources:
@@ -227,63 +213,67 @@ datasources:
     datasources:
       - name: Prometheus
         type: prometheus
-        url: http://${prometheus_svc}.prometheus.svc.cluster.local
+        url: http://${PROM_SVC}.prometheus.svc.cluster.local
         isDefault: true
         access: proxy
         jsonData:
           timeInterval: "5s"
 EOF
 
-  log_success "prometheus-datasource.yaml created at /tmp/prometheus-datasource.yaml"
+  ok "prometheus-datasource.yaml created at /tmp/prometheus-datasource.yaml"
 }
 
-# ---------- Step 5: Deploy Grafana ----------
-deploy_grafana() {
-  log_section "Step 5: Deploying Grafana"
+# ──────────────────────────────────────────────
+#  STEP 5 — Deploy Grafana
+# ──────────────────────────────────────────────
+step5_deploy_grafana() {
+  section "Step 5 — Deploy Grafana"
 
-  log_info "Adding Grafana Helm repo..."
+  info "Adding Grafana Helm repo..."
   helm repo add grafana https://grafana.github.io/helm-charts
   helm repo update
-  log_success "Helm repo added"
+  ok "Helm repo ready"
 
-  if kubectl get namespace grafana &>/dev/null; then
-    log_warn "Namespace 'grafana' already exists. Skipping creation."
-  else
-    kubectl create namespace grafana
-    log_success "Namespace 'grafana' created"
-  fi
+  kubectl get namespace grafana &>/dev/null || kubectl create namespace grafana && ok "Namespace 'grafana' ready"
 
   if helm status grafana -n grafana &>/dev/null; then
-    log_warn "Grafana already deployed. Skipping installation."
+    warn "Grafana already deployed. Skipping."
   else
-    log_info "Installing Grafana..."
+    info "Installing Grafana..."
     helm install grafana grafana/grafana \
       --namespace grafana \
       --set persistence.storageClassName="$STORAGE_CLASS" \
       --set persistence.enabled=true \
-      --set adminPassword="$GRAFANA_ADMIN_PASSWORD" \
+      --set adminPassword="$GRAFANA_PASSWORD" \
       --set service.type=LoadBalancer \
       --values /tmp/prometheus-datasource.yaml
-    log_success "Grafana deployed!"
+    ok "Grafana deployed!"
   fi
 
-  log_info "Waiting for Grafana pods to be ready..."
+  info "Waiting for Grafana pods..."
   kubectl wait --for=condition=ready pod \
     -l app.kubernetes.io/name=grafana \
     -n grafana \
-    --timeout=120s 2>/dev/null || log_warn "Timeout waiting for Grafana pods. Check manually."
+    --timeout=120s 2>/dev/null || warn "Pods not ready yet — check manually with: kubectl get pods -n grafana"
 
   kubectl get pods -n grafana
+  info "Get Grafana URL: kubectl get svc grafana -n grafana"
+  info "Login: admin / $GRAFANA_PASSWORD"
 }
 
-# ---------- Step 6: Setup HPA ----------
-setup_hpa() {
-  log_section "Step 6: Setting Up HPA (Horizontal Pod Autoscaler)"
+# ──────────────────────────────────────────────
+#  STEP 6 — Setup HPA
+# ──────────────────────────────────────────────
+step6_setup_hpa() {
+  section "Step 6 — Setup HPA (Horizontal Pod Autoscaler)"
 
-  # Create sample HPA deployment if hpa.yaml doesn't exist
-  if [ ! -f "hpa.yaml" ]; then
-    log_warn "hpa.yaml not found. Creating a sample HPA deployment..."
-    cat > /tmp/hpa.yaml <<EOF
+  if [ -f "hpa.yaml" ]; then
+    info "Applying hpa.yaml..."
+    kubectl apply -f hpa.yaml
+    ok "hpa.yaml applied"
+  else
+    warn "hpa.yaml not found. Creating sample deployment..."
+    kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -314,73 +304,61 @@ spec:
               cpu: "500m"
               memory: "256Mi"
 EOF
-    kubectl apply -f /tmp/hpa.yaml
-    log_success "Sample hpa-deploy Deployment applied"
-  else
-    log_info "Applying hpa.yaml..."
-    kubectl apply -f hpa.yaml
-    log_success "hpa.yaml applied"
+    ok "Sample hpa-deploy Deployment created"
   fi
 
-  log_info "Setting up HPA autoscale..."
   if kubectl get hpa hpa-deploy -n default &>/dev/null; then
-    log_warn "HPA for hpa-deploy already exists. Skipping."
+    warn "HPA for hpa-deploy already exists. Skipping."
   else
+    info "Configuring HPA autoscale..."
     kubectl autoscale deployment hpa-deploy \
-      --cpu-percent=50 \
-      --min=1 \
-      --max=10
-    log_success "HPA configured: CPU 50%, min=1, max=10"
+      --cpu-percent="$HPA_CPU_PERCENT" \
+      --min="$HPA_MIN" \
+      --max="$HPA_MAX"
+    ok "HPA configured — CPU: ${HPA_CPU_PERCENT}%, Min: ${HPA_MIN}, Max: ${HPA_MAX}"
   fi
 
   kubectl get hpa
 }
 
-# ---------- Step 7: Import Grafana Dashboards ----------
-import_grafana_dashboards() {
-  log_section "Step 7: Importing Grafana Dashboards"
+# ──────────────────────────────────────────────
+#  STEP 7 — Import Grafana Dashboards
+# ──────────────────────────────────────────────
+step7_import_dashboards() {
+  section "Step 7 — Import Grafana Dashboards"
 
-  log_info "Waiting for Grafana LoadBalancer to get external IP..."
-  local max_wait=180
-  local elapsed=0
-  local grafana_url=""
+  info "Waiting for Grafana LoadBalancer external IP/hostname..."
+  local elapsed=0 grafana_url=""
 
-  while [ $elapsed -lt $max_wait ]; do
+  while [ $elapsed -lt 180 ]; do
     grafana_url=$(kubectl get svc grafana -n grafana \
-      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+      -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+    [ -z "$grafana_url" ] && grafana_url=$(kubectl get svc grafana -n grafana \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
 
-    if [ -z "$grafana_url" ]; then
-      grafana_url=$(kubectl get svc grafana -n grafana \
-        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
-    fi
-
-    if [ -n "$grafana_url" ]; then
-      log_success "Grafana URL: http://$grafana_url"
-      break
-    fi
-
-    log_info "Waiting for external IP... ($elapsed/${max_wait}s)"
-    sleep 10
-    elapsed=$((elapsed + 10))
+    [ -n "$grafana_url" ] && break
+    info "Still waiting... ($elapsed/180s)"
+    sleep 10; elapsed=$((elapsed + 10))
   done
 
   if [ -z "$grafana_url" ]; then
-    log_warn "Could not get Grafana external URL. You can port-forward and import dashboards manually."
-    log_info "Run: kubectl port-forward svc/grafana 3000:80 -n grafana"
+    warn "LoadBalancer IP pending. Using localhost via port-forward..."
+    warn "Run this in another terminal: kubectl port-forward svc/grafana 3000:80 -n grafana"
     grafana_url="localhost:3000"
+  else
+    ok "Grafana URL: http://$grafana_url"
   fi
 
-  log_info "Importing dashboards into Grafana..."
-  for entry in "${GRAFANA_DASHBOARDS[@]}"; do
-    local dashboard_id="${entry%%:*}"
-    local dashboard_name="${entry##*:}"
+  GRAFANA_URL="http://$grafana_url"
 
-    log_info "  Importing Dashboard ID: $dashboard_id - $dashboard_name"
-    local response
-    response=$(curl -s -o /dev/null -w "%{http_code}" \
-      -X POST "http://$grafana_url/api/dashboards/import" \
+  info "Importing ${#DASHBOARD_IDS[@]} dashboards..."
+  echo ""
+  for ID in "${DASHBOARD_IDS[@]}"; do
+    NAME="${DASHBOARD_NAMES[$ID]}"
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+      -X POST "$GRAFANA_URL/api/dashboards/import" \
       -H "Content-Type: application/json" \
-      -u "admin:$GRAFANA_ADMIN_PASSWORD" \
+      -u "admin:$GRAFANA_PASSWORD" \
       -d "{
         \"inputs\": [{
           \"name\": \"DS_PROMETHEUS\",
@@ -390,23 +368,24 @@ import_grafana_dashboards() {
         }],
         \"folderId\": 0,
         \"overwrite\": true,
-        \"id\": $dashboard_id
+        \"id\": $ID
       }" 2>/dev/null || echo "000")
 
-    if [ "$response" = "200" ]; then
-      log_success "  Dashboard $dashboard_id ($dashboard_name) imported"
+    if [ "$HTTP_CODE" = "200" ]; then
+      ok "  ID $ID — $NAME"
     else
-      log_warn "  Dashboard $dashboard_id ($dashboard_name) - HTTP $response (may need manual import)"
+      warn "  ID $ID — $NAME (HTTP $HTTP_CODE — may need manual import)"
     fi
   done
 }
 
-# ---------- Step 8: Print Summary ----------
+# ──────────────────────────────────────────────
+#  SUMMARY
+# ──────────────────────────────────────────────
 print_summary() {
-  log_section "Setup Complete - Summary"
+  section "Setup Complete"
 
-  local grafana_url
-  grafana_url=$(kubectl get svc grafana -n grafana \
+  GRAFANA_URL=$(kubectl get svc grafana -n grafana \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || \
     kubectl get svc grafana -n grafana \
     -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || \
@@ -414,53 +393,55 @@ print_summary() {
 
   echo -e "${GREEN}${BOLD}"
   echo "  ╔══════════════════════════════════════════════════════╗"
-  echo "  ║         Monitoring Stack Deployed Successfully!      ║"
+  echo "  ║      Monitoring Stack Deployed Successfully! 🚀      ║"
   echo "  ╚══════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
-  echo -e "${BOLD}Cluster:${NC}        $CLUSTER_NAME ($REGION)"
-  echo -e "${BOLD}Grafana URL:${NC}    http://$grafana_url"
-  echo -e "${BOLD}Grafana Login:${NC}  admin / $GRAFANA_ADMIN_PASSWORD"
+  echo -e "  ${BOLD}Cluster:${NC}         $CLUSTER_NAME  ($REGION)"
+  echo -e "  ${BOLD}Grafana URL:${NC}     http://$GRAFANA_URL"
+  echo -e "  ${BOLD}Grafana Login:${NC}   admin / $GRAFANA_PASSWORD"
   echo ""
-  echo -e "${BOLD}Imported Dashboards:${NC}"
-  for entry in "${GRAFANA_DASHBOARDS[@]}"; do
-    local id="${entry%%:*}"
-    local name="${entry##*:}"
-    echo -e "  ${GREEN}✔${NC}  ID $id — $name"
+  echo -e "  ${BOLD}Dashboards Imported:${NC}"
+  for ID in "${DASHBOARD_IDS[@]}"; do
+    echo -e "    ${GREEN}✔${NC}  ID $ID — ${DASHBOARD_NAMES[$ID]}"
   done
-
   echo ""
-  echo -e "${BOLD}Useful Commands:${NC}"
-  echo "  kubectl get pods -n prometheus"
-  echo "  kubectl get pods -n grafana"
-  echo "  kubectl get hpa"
-  echo "  kubectl port-forward svc/grafana 3000:80 -n grafana"
-  echo "  kubectl port-forward svc/prometheus-deployment-server 9090:80 -n prometheus"
+  echo -e "  ${BOLD}Useful Commands:${NC}"
+  echo "    kubectl get pods -n prometheus"
+  echo "    kubectl get pods -n grafana"
+  echo "    kubectl get hpa"
+  echo "    kubectl port-forward svc/grafana 3000:80 -n grafana"
+  echo "    kubectl port-forward svc/prometheus-deployment-server 9090:80 -n prometheus"
   echo ""
-  log_success "All done! Happy monitoring 🚀"
+  echo -e "  ${BOLD}Cleanup:${NC}"
+  echo "    helm uninstall grafana -n grafana"
+  echo "    helm uninstall prometheus-deployment -n prometheus"
+  echo "    kubectl delete namespace grafana prometheus"
+  echo "    eksctl delete cluster --name $CLUSTER_NAME --region $REGION"
+  echo ""
+  echo -e "  ${YELLOW}Note:${NC} Dashboard ID 7249 (Kubernetes Cluster Summary) is confirmed working."
+  echo "        Start with that if others show empty panels."
+  echo ""
 }
 
-# ---------- Main ----------
+# ──────────────────────────────────────────────
+#  MAIN
+# ──────────────────────────────────────────────
 main() {
   echo -e "${BOLD}${CYAN}"
-  echo "  ██████╗ ██████╗  ██████╗ ███╗   ███╗    "
-  echo "  ██╔══██╗██╔══██╗██╔═══██╗████╗ ████║    "
-  echo "  ██████╔╝██████╔╝██║   ██║██╔████╔██║    "
-  echo "  ██╔═══╝ ██╔══██╗██║   ██║██║╚██╔╝██║    "
-  echo "  ██║     ██║  ██║╚██████╔╝██║ ╚═╝ ██║    "
-  echo "  ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝    "
-  echo ""
-  echo "  + Grafana | AWS EKS Monitoring Automation"
+  echo "  ╔════════════════════════════════════════════════════╗"
+  echo "  ║   Prometheus + Grafana on AWS EKS — Automation    ║"
+  echo "  ╚════════════════════════════════════════════════════╝"
   echo -e "${NC}"
 
   check_prerequisites
-  create_eks_cluster
-  install_ebs_csi_driver
-  deploy_prometheus
-  create_prometheus_datasource
-  deploy_grafana
-  setup_hpa
-  import_grafana_dashboards
+  step1_create_eks_cluster
+  step2_install_ebs_csi_driver
+  step3_deploy_prometheus
+  step4_create_datasource_config
+  step5_deploy_grafana
+  step6_setup_hpa
+  step7_import_dashboards
   print_summary
 }
 
